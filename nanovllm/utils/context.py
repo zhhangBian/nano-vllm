@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import torch
 
 
+# 记录相应的上下文信息,方便地在全局获取
 @dataclass
 class Context:
     is_prefill: bool = False

@@ -12,30 +12,39 @@ from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
 
+# 主要的基类，实现了LLM的功能
 class LLMEngine:
 
     def __init__(self, model, **kwargs):
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        # 对进程的管理
         self.ps = []
         self.events = []
+        # spawn：使用全新的进程上下文
         ctx = mp.get_context("spawn")
+        # 如果是多卡，则启动多个子进程
         for i in range(1, config.tensor_parallel_size):
             event = ctx.Event()
+            # 每个子进程控制一个gpu
             process = ctx.Process(target=ModelRunner, args=(config, i, event))
             process.start()
+            # 注册多进程
             self.ps.append(process)
             self.events.append(event)
         self.model_runner = ModelRunner(config, 0, self.events)
+        # 初始化tokenizer，运行在0号卡上（主）
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
+        # 初始化调度器
         self.scheduler = Scheduler(config)
         atexit.register(self.exit)
 
     def exit(self):
         self.model_runner.call("exit")
         del self.model_runner
+        # 通知所有子进程退出
         for p in self.ps:
             p.join()
 
@@ -45,17 +54,24 @@ class LLMEngine:
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
+    # 进行一轮计算
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        # 调用runner进行计算
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        # 完成计算后后处理
         self.scheduler.postprocess(seqs, token_ids)
+        # 完成的请求：没有stream
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
+        # prefill就是全部的token数；decode一次一个token，就是请求数
         num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
         return outputs, num_tokens
 
+    # 当前没有请求了
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    # 接收多个prompt，返回生成结果
     def generate(
         self,
         prompts: list[str] | list[list[int]],
@@ -68,10 +84,15 @@ class LLMEngine:
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
             self.add_request(prompt, sp)
+
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+
+        # 直到完成
         while not self.is_finished():
+            # 用于计算吞吐率的初始化时间
             t = perf_counter()
+            # step计算一次
             output, num_tokens = self.step()
             if use_tqdm:
                 if num_tokens > 0:
@@ -86,6 +107,7 @@ class LLMEngine:
                 outputs[seq_id] = token_ids
                 if use_tqdm:
                     pbar.update(1)
+        # 返回的输出信息：不需要包含prompt部分
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
         if use_tqdm:

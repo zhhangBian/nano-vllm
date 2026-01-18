@@ -5,13 +5,17 @@ from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 
 
+# 实际使用的调度器
 class Scheduler:
 
     def __init__(self, config: Config):
+        # 相应的配置
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
+        # 在其中结合了BlockManager来管理KV缓存
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # 使用两个队列
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -21,17 +25,23 @@ class Scheduler:
     def add(self, seq: Sequence):
         self.waiting.append(seq)
 
+    # 两级的调度机制：1. prefill 2. decode
+    # 优先prefill，直到prefill不下
     def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill
         scheduled_seqs = []
+        # 调度运行的请求数:batch size
         num_seqs = 0
         num_batched_tokens = 0
+
+        # prefill
         while self.waiting and num_seqs < self.max_num_seqs:
+            # 获取第一个等待的请求
             seq = self.waiting[0]
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
             num_seqs += 1
             self.block_manager.allocate(seq)
+            # 需要新计算的token数
             num_batched_tokens += len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
@@ -44,8 +54,10 @@ class Scheduler:
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
+                # 逐出一个请求,释放其已经计算的部分
                 if self.running:
                     self.preempt(self.running.pop())
+                # 没有可以逐出的请求了,逐出当前的请求
                 else:
                     self.preempt(seq)
                     break
@@ -54,17 +66,21 @@ class Scheduler:
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
+        # one by one 按照原始顺序放回去
         self.running.extendleft(reversed(scheduled_seqs))
         return scheduled_seqs, False
 
+    # 逐出相应的请求
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
+    # 一个step结束后的后处理
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
         for seq, token_id in zip(seqs, token_ids):
             seq.append_token(token_id)
+            # 结束 或 到达最大长度
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)

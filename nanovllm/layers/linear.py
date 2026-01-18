@@ -147,7 +147,9 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. 每个 GPU 计算自己的部分结果
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+        # 2. 如果有多个 GPU，执行 All-Reduce 将结果相加
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

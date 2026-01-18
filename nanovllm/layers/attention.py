@@ -7,18 +7,25 @@ from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
 
 
+# 将计算好的 Key/Value 写入到全局 KV Cache 内存池中
+# 实现了 PagedAttention 的写入操作，将连续的逻辑 Token 散列存储到非连续的物理显存块中
 @triton.jit
 def store_kvcache_kernel(
     key_ptr,
     key_stride,
     value_ptr,
     value_stride,
+    # 全局 KV Cache 内存池的指针（目标）
     k_cache_ptr,
     v_cache_ptr,
+    # 物理地址映射表
     slot_mapping_ptr,
+    # 每个 Token 的总数据量（num_heads * head_dim）
     D: tl.constexpr,
 ):
+    # 每个线程处理一个 Token
     idx = tl.program_id(0)
+    # 查表，找出这个 Token 应该存到内存池的哪个 Slot（物理位置）
     slot = tl.load(slot_mapping_ptr + idx)
     if slot == -1: return
     key_offsets = idx * key_stride + tl.arange(0, D)
@@ -30,6 +37,7 @@ def store_kvcache_kernel(
     tl.store(v_cache_ptr + cache_offsets, value)
 
 
+# kernel的包装器
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
@@ -54,14 +62,19 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
+        # 在 ModelRunner 中，这两个属性会被替换为指向全局大内存池的引用
         self.k_cache = self.v_cache = torch.tensor([])
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
+        # 获取上下文
         context = get_context()
+        # 写入KVC
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
+            # 如果 block_tables 存在，说明有部分 KV 已经存在 Cache 里了
+            # 此时直接用 k_cache 和 v_cache 作为 Key/Value 输入，而不是用当前的 k, v
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
